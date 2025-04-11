@@ -1,0 +1,2 @@
+TEXT Describe the object shown in the image.
+VIDEO resource/isl.mp4 What is happening in this video?

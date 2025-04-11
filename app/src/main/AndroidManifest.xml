@@ -1,13 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
+    <!-- Camera hardware features -->
     <uses-feature android:name="android.hardware.camera.any" />
-
+    <uses-feature android:name="android.hardware.camera.front" android:required="true" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+    
+    <!-- Permissions -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
     <application
         android:allowBackup="true"
@@ -16,7 +22,11 @@
         android:requestLegacyExternalStorage="true"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:supportsRtl="true"
+        android:hardwareAccelerated="true"
+        android:largeHeap="true"
         android:theme="@style/Theme.RecordTheseHands">
+        
+        <!-- Activities and services -->
         <activity
             android:name=".splash.LoadDataActivity"
             android:exported="false" />
@@ -53,8 +63,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        
         <activity
             android:name=".recording.RecordingActivity"
+            android:hardwareAccelerated="true"
+            android:screenOrientation="portrait"
+            android:configChanges="keyboardHidden|orientation|screenSize"
             android:parentActivityName=".splash.HomeScreenActivity" />
 
         <provider
@@ -70,6 +84,11 @@
         <activity
             android:name=".splash.PromptSelectActivity"
             android:exported="false" />
+            
+        <!-- Samsung specific camera workarounds -->
+        <meta-data
+            android:name="com.samsung.android.content.spay.app_feature"
+            android:value="camera" />
     </application>
 
 </manifest>

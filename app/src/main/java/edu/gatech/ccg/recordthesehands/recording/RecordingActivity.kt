@@ -33,26 +33,13 @@ import android.app.NotificationManager
 import android.content.Context
 import android.content.pm.ActivityInfo
 import android.content.pm.PackageManager
-import android.graphics.ImageFormat
-import android.hardware.camera2.CameraCaptureSession
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraDevice
-import android.hardware.camera2.CameraManager
-import android.hardware.camera2.CaptureRequest
-import android.media.MediaCodec
-import android.media.MediaRecorder
 import android.os.Bundle
 import android.os.CountDownTimer
 import android.os.Handler
-import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
-import android.util.Range
-import android.util.Size
 import android.view.HapticFeedbackConstants
 import android.view.MotionEvent
-import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
 import android.view.animation.CycleInterpolator
@@ -61,7 +48,19 @@ import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.CameraSelector
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
+import androidx.camera.view.PreviewView
+import androidx.concurrent.futures.await
 import androidx.constraintlayout.widget.ConstraintLayout
+import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
@@ -99,6 +98,13 @@ import java.time.Instant
 import java.time.format.DateTimeFormatter
 import kotlin.concurrent.thread
 import kotlin.random.Random
+import java.util.concurrent.Executor
+import android.widget.Toast
+import androidx.camera.core.impl.VideoCaptureConfig
+import android.os.Build
+import android.app.ActivityManager
+import edu.gatech.ccg.recordthesehands.recording.SamsungCameraHelper
+import android.widget.Button
 
 /**
  * Contains the data for a clip within the greater recording.
@@ -267,8 +273,7 @@ class RecordingActivity : AppCompatActivity() {
     private val TAG = RecordingActivity::class.java.simpleName
 
     /**
-     * Record video at 15 Mbps. At 1944x2592 @ 30 fps, this level of detail should be more
-     * than high enough.
+     * Video quality and resolution settings for CameraX
      */
     private const val RECORDER_VIDEO_BITRATE: Int = 15_000_000
 
@@ -276,6 +281,9 @@ class RecordingActivity : AppCompatActivity() {
      * Height, width, and frame rate of the video recording. Using a 4:3 aspect ratio allows us
      * to get the widest possible field of view on a Pixel 4a camera, which has a 4:3 sensor.
      * Any other aspect ratio would result in some degree of cropping.
+     * 
+     * Note: With CameraX, the precise resolution is selected by the Quality selector, but
+     * we keep these constants for reference.
      */
     private const val RECORDING_HEIGHT = 2592
     private const val RECORDING_WIDTH = 1944
@@ -318,6 +326,11 @@ class RecordingActivity : AppCompatActivity() {
   lateinit var restartButton: View
 
   /**
+   * Reset camera button for recovery from errors.
+   */
+  private lateinit var resetCameraButton: Button
+
+  /**
    * The UI that allows a user to swipe back and forth and make recordings.
    * The end screens are also included in this ViewPager.
    */
@@ -336,7 +349,7 @@ class RecordingActivity : AppCompatActivity() {
   /**
    * The recording preview.
    */
-  lateinit var cameraView: SurfaceView
+  lateinit var cameraView: PreviewView
 
   // UI state variables
   /**
@@ -469,60 +482,41 @@ class RecordingActivity : AppCompatActivity() {
   private var emailConfirmationEnabled: Boolean = false
 
 
-  // Camera API variables
+  // CameraX variables
   /**
-   * The thread for handling camera-related actions.
+   * Executor for camera operations
    */
-  private lateinit var cameraThread: HandlerThread
+  private lateinit var cameraExecutor: Executor
 
   /**
-   * The Handler object for accessing the camera. We primarily use this when initializing or
-   * shutting down the camera.
+   * CameraProvider instance for camera lifecycle management
    */
-  private lateinit var cameraHandler: Handler
+  private var cameraProvider: ProcessCameraProvider? = null
 
   /**
-   * The buffer to which camera frames are projected. This is used by the MediaRecorder to
-   * record the video
+   * VideoCapture instance for recording video
    */
-  private lateinit var recordingSurface: Surface
+  private var videoCapture: VideoCapture<Recorder>? = null
 
   /**
-   * The camera recorder instance, used to set up and control the recording settings.
+   * Current active recording
    */
-  private lateinit var recorder: MediaRecorder
-
-
-  /**
-   * A CameraCaptureSession object, which functions as a wrapper for handling / stopping the
-   * recording.
-   */
-  private lateinit var session: CameraCaptureSession
+  private var recording: Recording? = null
 
   /**
-   * Details of the camera being used to record the video.
+   * Camera selector for choosing front camera
    */
-  private lateinit var camera: CameraDevice
+  private val cameraSelector: CameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
+
+  /**
+   * Samsung-specific camera helper for better compatibility
+   */
+  private var samsungCameraHelper: SamsungCameraHelper? = null
 
   /**
    * Window insets controller for hiding and showing the toolbars.
    */
   var windowInsetsController: WindowInsetsControllerCompat? = null
-
-  /**
-   * The buffer to which the camera sends frames for the purposes of displaying a live preview
-   * (rendered in the `cameraView`).
-   */
-  private var previewSurface: Surface? = null
-
-  /**
-   * The operating system's camera service. We can get camera information from this service.
-   */
-  private val cameraManager: CameraManager by lazy {
-    val context = this.applicationContext
-    context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-  }
-
 
   // Permissions
   /**
@@ -547,95 +541,20 @@ class RecordingActivity : AppCompatActivity() {
     }
 
   /**
-   * A function to initialize a new thread for camera-related code to run on.
+   * Retry camera initialization after delay
    */
-  private fun generateCameraThread() = HandlerThread("CameraThread").apply { start() }
-
-  /**
-   * Generates a new [Surface] for storing recording data, which will promptly be assigned to
-   * the [recordingSurface] field above.
-   */
-  private fun createRecordingSurface(recordingSize: Size): Surface {
-    val surface = MediaCodec.createPersistentInputSurface()
-    recorder = MediaRecorder(this)
-
-    outputFile = applicationContext.filenameToFilepath(filename)
-    if (outputFile.parentFile?.let { !it.exists() } ?: false) {
-      Log.i(TAG, "creating directory ${outputFile.parentFile}.")
-      outputFile.parentFile?.mkdirs()
+  private fun retryInitializeCamera() {
+    try {
+      initializeCamera()
+    } catch (e: Exception) {
+      Log.e(TAG, "Second attempt to initialize camera failed", e)
+      setResult(RESULT_CAMERA_DIED)
+      finish()
     }
-
-    setRecordingParameters(recorder, surface, recordingSize).prepare()
-
-    return surface
   }
 
   /**
-   * Prepares a [MediaRecorder] using the given surface.
-   */
-  private fun setRecordingParameters(rec: MediaRecorder, surface: Surface, recordingSize: Size) =
-    rec.apply {
-      // Set the video settings from our predefined constants.
-      setVideoSource(MediaRecorder.VideoSource.SURFACE)
-      setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-      setOutputFile(outputFile.absolutePath)
-      setVideoEncodingBitRate(RECORDER_VIDEO_BITRATE)
-
-      setVideoFrameRate(RECORDING_FRAMERATE)
-      setVideoSize(recordingSize.width, recordingSize.height)
-
-      setVideoEncoder(MediaRecorder.VideoEncoder.HEVC)
-      setInputSurface(surface)
-
-      /**
-       * The orientation of 270 degrees (-90 degrees) was determined through
-       * experimentation. For now, we do not need to support other
-       * orientations than the default portrait orientation.
-       *
-       * The tablet orientation of 0 degrees is designed primarily to support the use of
-       * a Pixel Tablet (2023) with its included stand (although any tablet with a stand
-       * may suffice).
-       */
-      setOrientationHint(if (isTablet) 0 else 270)
-    }
-
-  private fun checkCameraPermission(): Boolean {
-    /**
-     * First, check camera permissions. If the user has not granted permission to use the
-     * camera, give a prompt asking them to grant that permission in the Settings app, then
-     * relaunch the app.
-     */
-    if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-
-      val errorRoot = findViewById<ConstraintLayout>(R.id.main_root)
-      val errorMessage = layoutInflater.inflate(
-        R.layout.permission_error, errorRoot,
-        false
-      )
-      errorRoot.addView(errorMessage)
-
-      // Since the user hasn't granted camera permissions, we need to stop here.
-      return false
-    }
-
-    return true
-  }
-
-  private fun getFrontCamera(): String {
-    for (id in cameraManager.cameraIdList) {
-      val face = cameraManager.getCameraCharacteristics(id)
-        .get(CameraCharacteristics.LENS_FACING)
-      if (face == CameraSelector.LENS_FACING_FRONT) {
-        return id
-      }
-    }
-
-    throw IllegalStateException("No front camera available")
-  }
-
-  /**
-   * This code initializes the camera-related portion of the code, adding listeners to enable
-   * video recording as long as we hold down the Record button.
+   * This code initializes the CameraX API and sets up video recording
    */
   @SuppressLint("ClickableViewAccessibility")
   private fun initializeCamera() = lifecycleScope.launch(Dispatchers.Main) {
@@ -643,27 +562,181 @@ class RecordingActivity : AppCompatActivity() {
       return@launch
     }
 
-    /**
-     * User has given permission to use the camera. First, find the front camera. If no
-     * front-facing camera is available, crash. (This shouldn't fail on any modern
-     * smartphone.)
-     */
-    val cameraId = getFrontCamera()
+    try {
+      // For Samsung devices, use our specialized helper
+      if (SamsungCameraHelper.isSamsungDevice()) {
+        Log.d(TAG, "Using Samsung-specific camera helper for ${Build.MODEL}")
+        
+        try {
+          // Check if activity is still active
+          if (isFinishing || isDestroyed) {
+            Log.d(TAG, "Activity no longer active, skipping Samsung camera initialization")
+            return@launch
+          }
+          
+          // Clean up any existing camera resources
+          if (cameraProvider != null) {
+            cameraProvider?.unbindAll()
+          }
+          if (isRecording) {
+            recording?.close()
+            recording = null
+            isRecording = false
+          }
+          
+          // Create and initialize the Samsung camera helper
+          samsungCameraHelper = SamsungCameraHelper(
+            this@RecordingActivity,
+            this@RecordingActivity,
+            cameraView
+          )
+          
+          // Show a message that we're initializing the camera
+          showToast("Initializing camera, please wait...")
+          resetCameraButton.visibility = View.GONE
+          
+          // Longer timeout for Samsung initialization
+          val initTimeout = Handler(Looper.getMainLooper())
+          val timeoutRunnable = Runnable {
+            if (!isFinishing && !isDestroyed && !cameraInitialized) {
+              Log.w(TAG, "Camera initialization timeout, showing reset button")
+              showResetCameraButton()
+            }
+          }
+          initTimeout.postDelayed(timeoutRunnable, 10000) // 10 second timeout
+          
+          samsungCameraHelper?.initializeCamera(
+            onSuccess = { 
+              // Check if activity is still active
+              if (!isFinishing && !isDestroyed) {
+                // Camera initialization successful
+                cameraInitialized = true
+                initTimeout.removeCallbacks(timeoutRunnable)
+                
+                // Only start recording if videoCapture is properly initialized
+                if (samsungCameraHelper?.isVideoCaptureInitialized() == true) {
+                  // Start recording immediately
+                  startRecording()
+                } else {
+                  Log.e(TAG, "VideoCapture still not initialized after successful callback")
+                  showToast("Camera initialized but recording not ready. Press Reset Camera to try again.")
+                  showResetCameraButton()
+                }
+                
+                // Set up touch listeners for buttons
+                setupTouchListeners()
+              } else {
+                Log.d(TAG, "Activity no longer active, not proceeding with camera initialization")
+                initTimeout.removeCallbacks(timeoutRunnable)
+              }
+            },
+            onError = { exception: Exception ->
+              // Check if activity is still active
+              if (!isFinishing && !isDestroyed) {
+                Log.e(TAG, "Samsung camera initialization failed", exception)
+                initTimeout.removeCallbacks(timeoutRunnable)
+                
+                runOnUiThread {
+                  Toast.makeText(
+                    this@RecordingActivity,
+                    "Camera initialization failed: ${exception.message}",
+                    Toast.LENGTH_LONG
+                  ).show()
+                  
+                  // Show reset button immediately on error
+                  showResetCameraButton()
+                }
+                
+                // Try one more time after a delay
+                Handler(Looper.getMainLooper()).postDelayed({
+                  if (!isFinishing && !isDestroyed) {
+                    retryInitializeCamera()
+                  }
+                }, 1500)
+              } else {
+                Log.d(TAG, "Activity no longer active, not handling camera error")
+                initTimeout.removeCallbacks(timeoutRunnable)
+              }
+            }
+          )
+          return@launch
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed to initialize Samsung camera helper", e)
+          showResetCameraButton()
+          // Will fall back to standard initialization below
+        }
+      }
+      
+      // Standard camera initialization for non-Samsung devices
+      // Get a stable reference to the ProcessCameraProvider
+      cameraProvider = ProcessCameraProvider.getInstance(this@RecordingActivity).await()
+      
+      // Set up the preview use case
+      val preview: Preview = Preview.Builder()
+        .setTargetRotation(cameraView.display.rotation)
+        .build()
+      
+      preview.setSurfaceProvider(cameraView.surfaceProvider)
 
-    /**
-     * Open the front-facing camera.
-     */
-    camera = openCamera(cameraManager, cameraId, cameraHandler)
+      // Set up quality selector for video recording
+      val qualitySelector = QualitySelector.from(Quality.HD)
+      
+      // Create recorder with quality selector
+      val recorder = Recorder.Builder()
+        .setQualitySelector(qualitySelector)
+        .build()
+      
+      // Create VideoCapture use case with the recorder
+      val videoCaptureObj = VideoCapture.withOutput(recorder)
+      
+      // Store the videoCapture for later use
+      this@RecordingActivity.videoCapture = videoCaptureObj
+      
+      try {
+        // Unbind all use cases before rebinding
+        cameraProvider?.unbindAll()
+        
+        // Bind use cases to camera
+        cameraProvider?.bindToLifecycle(
+          this@RecordingActivity,
+          cameraSelector,
+          preview,
+          videoCaptureObj
+        )
+        
+        // Start recording
+        startRecording()
 
-    /**
-     * Send video feed to both [previewSurface] and [recordingSurface], then start the
-     * recording.
-     */
-    val targets = listOf(previewSurface!!, recordingSurface)
-    session = createCaptureSession(camera, targets, cameraHandler)
+        // Set up touch listeners for buttons
+        setupTouchListeners()
 
-    startRecording()
+      } catch (exc: Exception) {
+        Log.e(TAG, "Use case binding failed", exc)
+        // Notify the user about camera issues
+        runOnUiThread {
+          Toast.makeText(this@RecordingActivity, 
+            "Camera initialization failed: ${exc.message}", 
+            Toast.LENGTH_LONG).show()
+          showResetCameraButton()
+        }
+      }
+      
+    } catch (exc: Exception) {
+      Log.e(TAG, "Camera initialization failed", exc)
+      // Notify the user about camera issues
+      runOnUiThread {
+        Toast.makeText(this@RecordingActivity, 
+          "Camera initialization failed: ${exc.message}", 
+          Toast.LENGTH_LONG).show()
+        showResetCameraButton()
+      }
+    }
+  }
 
+  /**
+   * Set up touch listeners for buttons
+   */
+  private fun setupTouchListeners() {
     recordButton.setOnTouchListener { view, event ->
       return@setOnTouchListener recordButtonOnTouchListener(view, event)
     }
@@ -676,6 +749,10 @@ class RecordingActivity : AppCompatActivity() {
       return@setOnTouchListener finishedButtonOnTouchListener(view, event)
     }
 
+    resetCameraButton = findViewById(R.id.resetCameraButton)
+    resetCameraButton.setOnClickListener {
+      handleResetCamera()
+    }
   }
 
   private fun newClipId(): String {
@@ -810,223 +887,171 @@ class RecordingActivity : AppCompatActivity() {
   }
 
   /**
-   * Adds a callback to the camera view, which is used primarily to assign a value to
-   * [previewSurface] once Android has finished creating the Surface for us. We need this
-   * because we cannot initialize a Surface object directly but we still need to be able to
-   * pass a Surface object around to the UI, which uses the contents of the Surface (buffer) to
-   * render the camera preview.
-   */
-  private fun setupCameraCallback() {
-    cameraView.holder.addCallback(object : SurfaceHolder.Callback {
-      /**
-       * Called when the OS has finished creating a surface for us.
-       */
-      override fun surfaceCreated(holder: SurfaceHolder) {
-        Log.d(TAG, "Initializing surface!")
-        previewSurface = holder.surface
-        initializeCamera()
-      }
-
-      /**
-       * Called if the surface had to be reassigned. In practical usage thus far, we have
-       * not run into any issues here by not reassigning [previewSurface] when this callback
-       * is triggered.
-       */
-      override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
-        Log.d(TAG, "New format, width, height: $format, $w, $h")
-        Log.d(TAG, "Camera preview surface changed!")
-      }
-
-      /**
-       * Called when the surface is destroyed. Typically this will occur when the activity
-       * closes.
-       */
-      override fun surfaceDestroyed(holder: SurfaceHolder) {
-        Log.d(TAG, "Camera preview surface destroyed!")
-        previewSurface = null
-      }
-    })
-  }
-
-
-  /**
-   * Opens up the requested Camera for a recording session.
-   *
-   * @suppress linter for "MissingPermission": acceptable here because this function is only
-   * ever called from [initializeCamera], which exits before calling this function if camera
-   * permission has been denied.
-   */
-  @SuppressLint("MissingPermission")
-  private suspend fun openCamera(
-    manager: CameraManager,
-    cameraId: String,
-    handler: Handler? = null
-  ): CameraDevice = suspendCancellableCoroutine { caller ->
-    manager.openCamera(
-      cameraId, object : CameraDevice.StateCallback() {
-        /**
-         * Once the camera has been successfully opened, resume execution in the calling
-         * function.
-         */
-        override fun onOpened(device: CameraDevice) {
-          Log.d(TAG, "openCamera: New camera created with ID $cameraId")
-          caller.resume(device)
-        }
-
-        /**
-         * If the camera is disconnected, end the activity and return to the splash screen.
-         */
-        override fun onDisconnected(device: CameraDevice) {
-          Log.e(TAG, "openCamera: Camera $cameraId has been disconnected")
-          this@RecordingActivity.apply {
-            sessionInfo.result = "RESULT_CAMERA_DIED"
-            stopRecorder()
-            setResult(RESULT_CAMERA_DIED)
-            finish()
-          }
-        }
-
-        /**
-         * If there's an error while opening the camera, pass that exception to the
-         * calling function.
-         */
-        override fun onError(device: CameraDevice, error: Int) {
-          val msg = when (error) {
-            ERROR_CAMERA_DEVICE -> "Fatal (device)"
-            ERROR_CAMERA_DISABLED -> "Device policy"
-            ERROR_CAMERA_IN_USE -> "Camera in use"
-            ERROR_CAMERA_SERVICE -> "Fatal (service)"
-            ERROR_MAX_CAMERAS_IN_USE -> "Maximum cameras in use"
-            else -> "Unknown"
-          }
-          val exc = RuntimeException("Camera $cameraId error: ($error) $msg")
-          Log.e(TAG, exc.message, exc)
-          if (caller.isActive) {
-            caller.resumeWithException(exc)
-          }
-        }
-      },
-
-      // Pass this code onto the camera handler thread
-      handler
-    )
-  }
-
-  /**
-   * Create a CameraCaptureSession. This is required by the camera API
-   */
-  private suspend fun createCaptureSession(
-    device: CameraDevice,
-    targets: List<Surface>,
-    handler: Handler? = null
-  ): CameraCaptureSession = suspendCoroutine { cont ->
-    /**
-     * Set up the camera capture session with the success / failure handlers defined below
-     */
-    device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
-      // Capture session successfully configured - resume execution
-      override fun onConfigured(session: CameraCaptureSession) {
-        cont.resume(session)
-      }
-
-      // Capture session config failed - throw exception
-      override fun onConfigureFailed(session: CameraCaptureSession) {
-        val exc = RuntimeException("Camera ${device.id} session configuration failed")
-        Log.e(TAG, exc.message, exc)
-        cont.resumeWithException(exc)
-      }
-    }, handler)
-  }
-
-
-  /**
-   * Starts the camera recording once we have device and capture session information within
-   * [initializeCamera].
+   * Starts the camera recording
    */
   private fun startRecording() {
-    // Lock screen orientation
-    this@RecordingActivity.requestedOrientation =
-      ActivityInfo.SCREEN_ORIENTATION_LOCKED
-
-    /**
-     * Create a request to record at 30fps.
-     */
-    val cameraRequest = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-      // Add the previewSurface buffer as a destination for the camera feed if it exists
-      previewSurface?.let {
-        addTarget(it)
-      }
-
-      // Add the recording buffer as a destination for the camera feed
-      addTarget(recordingSurface)
-
-      // Lock FPS at 30
-      set(
-        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-        Range(RECORDING_FRAMERATE, RECORDING_FRAMERATE)
-      )
-
-      // Disable video stabilization. This ensures that we don't get a cropped frame
-      // due to software stabilization.
-      set(
-        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
-        CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF
-      )
-      set(
-        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-        CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF
-      )
-    }.build()
-
-    session.setRepeatingRequest(cameraRequest, null, cameraHandler)
-
-    UploadService.pauseUploadTimeout(COUNTDOWN_DURATION + UploadService.UPLOAD_RESUME_ON_IDLE_TIMEOUT)
-    isRecording = true
-
-    recorder.start()
-    sessionStartTime = Instant.now()
-
-    CoroutineScope(Dispatchers.IO).launch {
-      sessionInfo.startTimestamp = sessionStartTime
-      dataManager.saveSessionInfo(sessionInfo)
-
-      val timestamp = DateTimeFormatter.ISO_INSTANT.format(Instant.now())
-      val json = JSONObject()
-      json.put("filename", filename)
-      json.put("startTimestamp", sessionStartTime)
-      dataManager.addKeyValue("recording_started-${timestamp}", json, "recording")
+    if (isRecording) return
+    
+    // Check if activity is still active
+    if (isFinishing || isDestroyed) {
+      Log.d(TAG, "Activity is finishing or destroyed, not starting recording")
+      return
     }
-
-    setButtonState(recordButton, true)
-    recordButtonEnabled = true
-
-    // Set up the countdown timer.
-    countdownText = findViewById(R.id.timerLabel)
-    countdownTimer = object : CountDownTimer(COUNTDOWN_DURATION, 1000) {
-      // Update the timer text every second.
-      override fun onTick(p0: Long) {
-        val rawSeconds = (p0 / 1000).toInt() + 1
-        val minutes = padZeroes(rawSeconds / 60, 2)
-        val seconds = padZeroes(rawSeconds % 60, 2)
-        countdownText.text = "$minutes:$seconds"
+    
+    try {
+      // Initialize sessionStartTime when recording starts
+      if (!::sessionStartTime.isInitialized) {
+        sessionStartTime = Instant.now()
       }
+      
+      val outputFile = createOutputFile()
+      if (outputFile == null) {
+        showToast("Failed to create output file")
+        return
+      }
+      
+      if (SamsungCameraHelper.isSamsungDevice()) {
+        // For Samsung, give a small delay before starting
+        Handler(Looper.getMainLooper()).postDelayed({
+          // Check again if activity is still active
+          if (isFinishing || isDestroyed) {
+            Log.d(TAG, "Activity is no longer active, aborting delayed recording start")
+            return@postDelayed
+          }
+          
+          samsungCameraHelper?.startRecording(
+            outputFile,
+            onSuccess = {
+              // Final activity state check
+              if (!isFinishing && !isDestroyed) {
+                isRecording = true
+                updateUIForRecordingState()
+              }
+            },
+            onError = { e ->
+              // Final activity state check
+              if (!isFinishing && !isDestroyed) {
+                Log.e(TAG, "Samsung recording failed", e)
+                showToast("Failed to start recording. Retrying...")
+                
+                // Reset camera state and try again after delay
+                samsungCameraHelper?.resetCameraState()
+                Handler(Looper.getMainLooper()).postDelayed({
+                  // Check if activity is still active before retry
+                  if (!isFinishing && !isDestroyed) {
+                    samsungCameraHelper?.startRecording(
+                      outputFile,
+                      onSuccess = {
+                        // Final activity state check
+                        if (!isFinishing && !isDestroyed) {
+                          isRecording = true
+                          updateUIForRecordingState()
+                          // Hide reset button on success
+                          resetCameraButton.visibility = View.GONE
+                        }
+                      },
+                      onError = { e2 ->
+                        // Final activity state check
+                        if (!isFinishing && !isDestroyed) {
+                          Log.e(TAG, "Samsung recording retry failed", e2)
+                          showToast("Failed to start recording: ${e2.message}")
+                          // Show reset button after failed retry
+                          showResetCameraButton()
+                        }
+                      }
+                    )
+                  }
+                }, 1000)
+              }
+            }
+          )
+        }, 500) // Delay before starting recording on Samsung
+      } else {
+        // Non-Samsung recording code
+        val videoCapture = this.videoCapture ?: throw IllegalStateException("VideoCapture not initialized")
+        
+        // Configure output options
+        val outputOptions = FileOutputOptions.Builder(outputFile)
+          .build()
+        
+        // Start recording
+        recording = videoCapture.output
+          .prepareRecording(this, outputOptions)
+          .start(cameraExecutor) { event ->
+            // Final activity state check inside event handler
+            if (!isFinishing && !isDestroyed) {
+              when (event) {
+                is VideoRecordEvent.Start -> {
+                  Log.i(TAG, "Recording started")
+                  isRecording = true
+                  updateUIForRecordingState()
+                }
+                is VideoRecordEvent.Finalize -> {
+                  if (event.hasError()) {
+                    Log.e(TAG, "Recording failed: ${event.error}")
+                    showToast("Recording failed: ${event.error}")
+                  } else {
+                    Log.i(TAG, "Recording successfully finalized")
+                  }
+                }
+                else -> {
+                  // Status or other events
+                  Log.d(TAG, "Sent VideoRecordEvent class ${event.javaClass.simpleName}")
+                }
+              }
+            }
+          }
+      }
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to start recording", e)
+      showToast("Failed to start recording: ${e.message}")
+    }
+  }
 
-      // When the timer expires, move to the summary page (or have the app move there as soon
-      // as the user finishes the recording they're currently working on).
-      override fun onFinish() {
-        if (isSigning) {
-          // TODO test this.
-          endSessionOnClipEnd = true
-        } else {
-          // TODO test this.
-          goToSummaryPage()
+  private fun stopRecording() {
+    if (!isRecording) return
+    
+    // Check if activity is still active
+    if (isFinishing || isDestroyed) {
+      Log.d(TAG, "Activity is finishing or destroyed, aborting stopRecording")
+      isRecording = false // Force reset the flag
+      return
+    }
+    
+    try {
+      if (SamsungCameraHelper.isSamsungDevice()) {
+        // For Samsung devices, use our specialized helper
+        try {
+          samsungCameraHelper?.stopRecording()
+        } catch (e: Exception) {
+          Log.e(TAG, "Error stopping Samsung recording", e)
+        }
+      } else {
+        // Non-Samsung stop recording
+        try {
+          recording?.stop()
+        } catch (e: Exception) {
+          Log.e(TAG, "Error stopping recording, trying close", e)
+          recording?.close()
+        } finally {
+          recording = null
         }
       }
-    } // CountDownTimer
-
-    countdownTimer.start()
-
-    recordingLightView.visibility = View.VISIBLE
+      
+      isRecording = false
+      updateUIForRecordingState()
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to stop recording", e)
+      
+      // Check if activity is still active before showing toast
+      if (!isFinishing && !isDestroyed) {
+        showToast("Failed to stop recording: ${e.message}")
+      }
+      
+      // Force recording state to false to allow new recordings
+      isRecording = false
+      updateUIForRecordingState()
+    }
   }
 
   fun setButtonState(button: View, visible: Boolean) {
@@ -1097,7 +1122,46 @@ class RecordingActivity : AppCompatActivity() {
    */
   override fun onDestroy() {
     try {
+      // Ensure all camera resources are properly released
+      if (isRecording) {
+        isRecording = false
+        try {
+          recording?.close()
+          recording = null
+        } catch (e: Exception) {
+          Log.e(TAG, "Error closing recording in onDestroy", e)
+        }
+      }
+      
+      // Release camera resources
+      try {
+        // Release standard camera resources
+        cameraProvider?.unbindAll()
+        cameraProvider = null
+        
+        // Release Samsung-specific camera resources if applicable
+        samsungCameraHelper?.releaseCamera()
+        samsungCameraHelper = null
+      } catch (e: Exception) {
+        Log.e(TAG, "Error unbinding camera in onDestroy", e)
+      }
+      
+      // Additional cleanup for Samsung devices
+      if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+        try {
+          // Force garbage collection to help free camera resources
+          System.gc()
+        } catch (e: Exception) {
+          Log.e(TAG, "Error with Samsung-specific cleanup", e)
+        }
+      }
+      
       super.onDestroy()
+      
+      // Shutdown camera executor
+      if (::cameraExecutor.isInitialized) {
+        cameraExecutor.toString() // No real shutdown needed for MainExecutor
+      }
     } catch (exc: Throwable) {
       Log.e(TAG, "Error in RecordingActivity.onDestroy()", exc)
     }
@@ -1108,15 +1172,20 @@ class RecordingActivity : AppCompatActivity() {
       isRecording = false
       Log.i(TAG, "stopRecorder: stopping recording.")
 
-      recorder.stop()
-      session.stopRepeating()
-      session.close()
-      recorder.release()
-      camera.close()
-      cameraThread.quitSafely()
-      recordingSurface.release()
+      // Stop the current recording
+      val currentRecording = recording
+      if (currentRecording != null) {
+        currentRecording.stop()
+        recording = null
+      }
+      
+      // Release camera resources
+      cameraProvider?.unbindAll()
+      
+      // Cancel the countdown timer
+      if (::countdownTimer.isInitialized) {
       countdownTimer.cancel()
-      cameraHandler.removeCallbacksAndMessages(null)
+      }
 
       runOnUiThread {
         recordingLightView.visibility = View.GONE
@@ -1131,13 +1200,26 @@ class RecordingActivity : AppCompatActivity() {
         dataManager.addKeyValue("recording_stopped-${timestamp}", json, "recording")
         dataManager.registerFile(outputFile.relativeTo(applicationContext.filesDir).path)
         prompts.savePromptIndex()
+        
+        // Ensure startTimestamp is set
+        if (sessionInfo.startTimestamp == null) {
+          sessionInfo.startTimestamp = if (::sessionStartTime.isInitialized) sessionStartTime else now
+        }
+        
         sessionInfo.endTimestamp = now
         sessionInfo.finalPromptIndex = prompts.promptIndex
         dataManager.saveSessionInfo(sessionInfo)
+        
+        // Handle duration calculation with null checks
+        if (sessionInfo.startTimestamp != null && sessionInfo.endTimestamp != null) {
         dataManager.updateLifetimeStatistics(
           Duration.between(sessionInfo.startTimestamp, sessionInfo.endTimestamp)
         )
-        // Persist the data.  This will lock the dataManager for a few seconds, which is
+        } else {
+          Log.e(TAG, "Cannot calculate duration: startTimestamp=${sessionInfo.startTimestamp}, endTimestamp=${sessionInfo.endTimestamp}")
+        }
+        
+        // Persist the data. This will lock the dataManager for a few seconds, which is
         // only acceptable because we are not recording.
         dataManager.persistData()
       }
@@ -1313,9 +1395,20 @@ class RecordingActivity : AppCompatActivity() {
       }
     })
 
-    // Set up the camera preview's size
+    // Set up the camera preview
     cameraView = findViewById(R.id.cameraPreview)
-    cameraView.holder.setSizeFromLayout()
+
+    // Initialize sessionStartTime
+    sessionStartTime = Instant.now()
+    
+    // Set session start timestamp
+    if (sessionInfo.startTimestamp == null) {
+      sessionInfo.startTimestamp = sessionStartTime
+      // Save the updated session info
+      CoroutineScope(Dispatchers.IO).launch {
+        dataManager.saveSessionInfo(sessionInfo)
+      }
+    }
 
     val aspectRatioConstraint = findViewById<ConstraintLayout>(R.id.aspectRatioConstraint)
     val layoutParams = aspectRatioConstraint.layoutParams
@@ -1323,8 +1416,37 @@ class RecordingActivity : AppCompatActivity() {
     aspectRatioConstraint.layoutParams = layoutParams
 
     recordingLightView = findViewById(R.id.recordingLight)
-
     recordingLightView.visibility = View.GONE
+    
+    // Initialize camera executor
+    cameraExecutor = ContextCompat.getMainExecutor(this)
+
+    // Apply Samsung-specific optimizations
+    if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+      // Ensure camera resources are properly released if this activity is recreated
+      if (isRecording) {
+        isRecording = false
+        videoCapture = null
+        cameraProvider?.unbindAll()
+      }
+      
+      // Set specific camera parameters known to work better with Samsung devices
+      window.addFlags(WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED)
+      
+      // Set application to high priority to reduce the chance of resource reclamation
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        try {
+          // Process.setProcessImportance is only available in API 33+
+          activityManager.appTasks.firstOrNull()?.setExcludeFromRecents(false)
+        } catch (e: Exception) {
+          Log.e(TAG, "Failed to set process importance", e)
+        }
+      }
+    }
+
+    resetCameraButton = findViewById(R.id.resetCameraButton)
+    resetCameraButton.visibility = View.GONE
   }
 
   private fun animateGoText() {
@@ -1416,56 +1538,44 @@ class RecordingActivity : AppCompatActivity() {
 
   /**
    * Handle activity resumption (typically from multitasking)
-   * TODO there is a mismatch between when things are deallocated in onStop and where they
-   * TODO are initialized in onResume.
    */
   override fun onResume() {
     super.onResume()
 
     windowInsetsController?.hide(WindowInsetsCompat.Type.systemBars())
-    // Create camera thread
-    cameraThread = generateCameraThread()
-    cameraHandler = Handler(cameraThread.looper)
-
-    val cameraId = getFrontCamera()
-    val props = cameraManager.getCameraCharacteristics(cameraId)
-
-    val sizes = props.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-    Log.i(TAG, sizes.toString())
-
-    fun hasAspectRatio(heightRatio: Int, widthRatio: Int, dim: Size): Boolean {
-      val target = heightRatio.toFloat() / widthRatio.toFloat()
-      return ((dim.width.toFloat() / dim.height.toFloat()) - target < 0.01)
+    
+    // Special handling for Samsung devices
+    if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+      Log.d(TAG, "Running on Samsung device: ${Build.MODEL}")
+      
+      // Some Samsung devices need additional time to initialize the camera
+      Thread.sleep(100)
     }
-
-    val heightRatio = if (isTablet) 4 else 3
-    val widthRatio = if (isTablet) 3 else 4
-    val mainAspectRatio = findViewById<ConstraintLayout>(R.id.aspectRatioConstraint)
-    (mainAspectRatio.layoutParams as ConstraintLayout.LayoutParams).dimensionRatio =
-        "H,${heightRatio}:${widthRatio}"
-
-    val largestAvailableSize = sizes?.getOutputSizes(ImageFormat.JPEG)?.filter {
-      // Find a resolution smaller than the maximum pixel count (6 MP)
-      // with an aspect ratio of either 4:3 or 3:4, depending on whether we are using
-      // a tablet or not.
-      it.width * it.height < MAXIMUM_RESOLUTION
-          && (hasAspectRatio(heightRatio, widthRatio, it))
-    }?.maxByOrNull { it.width * it.height }
-
-    val chosenSize = largestAvailableSize ?: Size(RECORDING_HEIGHT, RECORDING_WIDTH)
-
-
-    Log.i(TAG, "Selected video resolution: ${chosenSize.width} x ${chosenSize.height}")
-    recordingSurface = createRecordingSurface(chosenSize)
-
+    
     /**
-     * If we already finished the recording activity, no need to restart the camera thread
+     * If we already finished the recording activity, no need to restart the camera
      */
     if (sessionPager.currentItem >= prompts.array.size) {
       return
     } else if (!cameraInitialized) {
-      setupCameraCallback()
+      try {
+        initializeCamera()
       cameraInitialized = true
+      } catch (e: Exception) {
+        Log.e(TAG, "Failed to initialize camera on resume", e)
+        Toast.makeText(this, "Camera initialization failed: ${e.message}", Toast.LENGTH_LONG).show()
+        
+        // Try one more time after a short delay on Samsung devices
+        if (Build.MANUFACTURER.equals("samsung", ignoreCase = true)) {
+          Handler(Looper.getMainLooper()).postDelayed({
+            try {
+              initializeCamera()
+            } catch (e2: Exception) {
+              Log.e(TAG, "Second attempt to initialize camera failed", e2)
+            }
+          }, 500)
+        }
+      }
     }
   }
 
@@ -1555,5 +1665,209 @@ class RecordingActivity : AppCompatActivity() {
     }
   }
 
+  private fun checkCameraPermission(): Boolean {
+    /**
+     * First, check camera permissions. If the user has not granted permission to use the
+     * camera, give a prompt asking them to grant that permission in the Settings app, then
+     * relaunch the app.
+     */
+    if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+
+      val errorRoot = findViewById<ConstraintLayout>(R.id.main_root)
+      val errorMessage = layoutInflater.inflate(
+        R.layout.permission_error, errorRoot,
+        false
+      )
+      errorRoot.addView(errorMessage)
+
+      // Since the user hasn't granted camera permissions, we need to stop here.
+      return false
+    }
+
+    return true
+  }
+
+  /**
+   * Show a toast message
+   */
+  private fun showToast(message: String) {
+    Toast.makeText(this, message, Toast.LENGTH_LONG).show()
+  }
+
+  /**
+   * Create output file for recording
+   */
+  private fun createOutputFile(): File? {
+    try {
+      // Create output file
+      outputFile = applicationContext.filenameToFilepath(filename)
+      if (outputFile.parentFile?.let { !it.exists() } ?: false) {
+        Log.i(TAG, "creating directory ${outputFile.parentFile}.")
+        outputFile.parentFile?.mkdirs()
+      }
+      return outputFile
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to create output file", e)
+      return null
+    }
+  }
+
+  /**
+   * Update UI based on recording state
+   */
+  private fun updateUIForRecordingState() {
+    // Check if activity is still active before updating UI
+    if (isFinishing || isDestroyed) {
+      Log.d(TAG, "Activity is finishing or destroyed, not updating UI")
+      return
+    }
+    
+    // Ensure sessionStartTime is initialized
+    if (!::sessionStartTime.isInitialized) {
+      sessionStartTime = Instant.now()
+    }
+    
+    runOnUiThread {
+      if (isRecording) {
+        recordingLightView.visibility = View.VISIBLE
+        
+        // Set up the countdown timer
+        countdownText = findViewById(R.id.timerLabel)
+        countdownTimer = object : CountDownTimer(COUNTDOWN_DURATION, 1000) {
+          // Update the timer text every second
+          override fun onTick(p0: Long) {
+            // Check if activity is still active
+            if (!isFinishing && !isDestroyed) {
+              val rawSeconds = (p0 / 1000).toInt() + 1
+              val minutes = padZeroes(rawSeconds / 60, 2)
+              val seconds = padZeroes(rawSeconds % 60, 2)
+              countdownText.text = "$minutes:$seconds"
+            }
+          }
+
+          // When the timer expires, handle session end
+          override fun onFinish() {
+            // Check if activity is still active
+            if (!isFinishing && !isDestroyed) {
+              if (isSigning) {
+                endSessionOnClipEnd = true
+              } else {
+                goToSummaryPage()
+              }
+            }
+          }
+        }
+        countdownTimer.start()
+        
+        // Enable record button if not currently signing
+        if (!isSigning) {
+          setButtonState(recordButton, true)
+          recordButtonEnabled = true
+        }
+      } else {
+        recordingLightView.visibility = View.GONE
+        if (::countdownTimer.isInitialized) {
+          countdownTimer.cancel()
+        }
+      }
+    }
+  }
+
+  private fun handleResetCamera() {
+    // Show feedback that we're resetting
+    showToast("Resetting camera...")
+    
+    // If currently recording, stop it
+    if (isRecording) {
+      try {
+        if (SamsungCameraHelper.isSamsungDevice()) {
+          samsungCameraHelper?.stopRecording()
+        } else {
+          recording?.stop()
+          recording = null
+        }
+      } catch (e: Exception) {
+        Log.e(TAG, "Error stopping recording during reset", e)
+      }
+      isRecording = false
+    }
+    
+    // Hide reset button while we're working
+    resetCameraButton.visibility = View.GONE
+    
+    // Release and re-initialize camera
+    if (SamsungCameraHelper.isSamsungDevice()) {
+      try {
+        // Release Samsung helper
+        samsungCameraHelper?.releaseCamera()
+        samsungCameraHelper = null
+        
+        // Small delay before re-initialization
+        Handler(Looper.getMainLooper()).postDelayed({
+          // Check if activity is still active before re-initializing
+          if (!isFinishing && !isDestroyed) {
+            // Create and initialize the Samsung camera helper
+            samsungCameraHelper = SamsungCameraHelper(
+              this@RecordingActivity,
+              this@RecordingActivity,
+              cameraView
+            )
+            
+            samsungCameraHelper?.initializeCamera(
+              onSuccess = { 
+                // Check if activity is still active before proceeding
+                if (!isFinishing && !isDestroyed) {
+                  // Camera initialization successful
+                  cameraInitialized = true
+                  // Start recording immediately
+                  startRecording()
+                  // Hide reset button
+                  resetCameraButton.visibility = View.GONE
+                }
+              },
+              onError = { exception: Exception ->
+                // Check if activity is still active before showing error
+                if (!isFinishing && !isDestroyed) {
+                  Log.e(TAG, "Samsung camera reset failed", exception)
+                  showToast("Camera reset failed: ${exception.message}")
+                  // Show reset button again since we failed
+                  resetCameraButton.visibility = View.VISIBLE
+                }
+              }
+            )
+          } else {
+            Log.d(TAG, "Activity no longer active, skipping camera re-initialization")
+          }
+        }, 1000)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error during camera reset", e)
+        showToast("Camera reset failed: ${e.message}")
+        resetCameraButton.visibility = View.VISIBLE
+      }
+    } else {
+      // Standard camera re-initialization
+      try {
+        cameraProvider?.unbindAll()
+        cameraProvider = null
+        
+        Handler(Looper.getMainLooper()).postDelayed({
+          // Check if activity is still active
+          if (!isFinishing && !isDestroyed) {
+            initializeCamera()
+          } else {
+            Log.d(TAG, "Activity no longer active, skipping camera re-initialization")
+          }
+        }, 1000)
+      } catch (e: Exception) {
+        Log.e(TAG, "Error during standard camera reset", e)
+        showToast("Camera reset failed: ${e.message}")
+        resetCameraButton.visibility = View.VISIBLE
+      }
+    }
+  }
+
+  private fun showResetCameraButton() {
+    resetCameraButton.visibility = View.VISIBLE
+  }
 } // RecordingActivity
 
