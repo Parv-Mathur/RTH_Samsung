@@ -679,7 +679,7 @@ class RecordingActivity : AppCompatActivity() {
       preview.setSurfaceProvider(cameraView.surfaceProvider)
 
       // Set up quality selector for video recording
-      val qualitySelector = QualitySelector.from(Quality.HD)
+      val qualitySelector = QualitySelector.from(Quality.HIGHEST)
       
       // Create recorder with quality selector
       val recorder = Recorder.Builder()

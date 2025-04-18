@@ -1,0 +1,4 @@
+VIDEO resource/apple.mp4 Apple
+VIDEO resource/ball.mp4 Ball
+VIDEO resource/book.mp4 Book
+VIDEO resource/dog.mp4 Dog

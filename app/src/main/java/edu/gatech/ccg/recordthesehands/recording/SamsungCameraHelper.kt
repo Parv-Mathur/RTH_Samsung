@@ -97,18 +97,12 @@ class SamsungCameraHelper(
                 preview.setSurfaceProvider(previewView.surfaceProvider)
                 
                 // Set up quality selector for video recording
-                val qualitySelector = QualitySelector.from(Quality.HD)
+                val qualitySelector = QualitySelector.from(Quality.HIGHEST)
                 
-                // Create recorder with quality selector - use lower quality for Samsung A34
-                val recorder = if (isSamsungGalaxyA34()) {
-                    Recorder.Builder()
-                        .setQualitySelector(QualitySelector.from(Quality.SD))
-                        .build()
-                } else {
-                    Recorder.Builder()
-                        .setQualitySelector(qualitySelector)
-                        .build()
-                }
+                // Create recorder with quality selector
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(qualitySelector)
+                    .build()
                 
                 // Create VideoCapture use case with the recorder
                 videoCapture = VideoCapture.withOutput(recorder)
@@ -192,16 +186,13 @@ class SamsungCameraHelper(
                 // Configure the preview view
                 preview.setSurfaceProvider(previewView.surfaceProvider)
                 
-                // Set up quality selector for video recording - use lower quality for Samsung A34
-                val recorder = if (isSamsungGalaxyA34()) {
-                    Recorder.Builder()
-                        .setQualitySelector(QualitySelector.from(Quality.SD))
-                        .build()
-                } else {
-                    Recorder.Builder()
-                        .setQualitySelector(QualitySelector.from(Quality.HD))
-                        .build()
-                }
+                // Set up quality selector for video recording
+                val qualitySelector = QualitySelector.from(Quality.HIGHEST)
+                
+                // Create recorder with quality selector
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(qualitySelector)
+                    .build()
                 
                 // Create VideoCapture use case with the recorder
                 videoCapture = VideoCapture.withOutput(recorder)

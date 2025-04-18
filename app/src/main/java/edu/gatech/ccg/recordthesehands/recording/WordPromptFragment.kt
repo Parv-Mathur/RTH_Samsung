@@ -34,12 +34,10 @@ import android.widget.TextView
 import android.widget.VideoView
 import androidx.annotation.LayoutRes
 import androidx.fragment.app.Fragment
-import androidx.transition.Visibility
 import edu.gatech.ccg.recordthesehands.upload.Prompt
 import edu.gatech.ccg.recordthesehands.upload.PromptType
 import edu.gatech.ccg.recordthesehands.R
 import java.io.File
-import kotlin.math.roundToInt
 
 /**
  * This is the little rectangle at the top of the screen that prompts the
@@ -127,27 +125,7 @@ class WordPromptFragment(
         }
       }
     }
-    // if (!hasVideo) {
-    //   val promptView = view.findViewById<ConstraintLayout>(R.id.promptLayout)
-
-    //   ConstraintSet().apply {
-    //     clone(promptView)
-    //     connect(
-    //       R.id.promptText, ConstraintSet.END, R.id.promptView,
-    //       ConstraintSet.END, 8
-    //     )
-    //     constrainWidth(
-    //       R.id.promptText,
-    //       ConstraintLayout.LayoutParams.MATCH_CONSTRAINT
-    //     )
-    //     applyTo(promptView)
-    //   }
-    // }
-
-    //if (prompt.prompt.length > 20) {
-    //  textView.setAutoSizeTextTypeWithDefaults(TextView.AUTO_SIZE_TEXT_TYPE_NONE)
-    //  textView.textSize = 18.0f
-    // }
   }
-
 }
+
+

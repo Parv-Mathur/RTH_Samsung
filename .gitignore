@@ -98,3 +98,4 @@ fastlane/readme.md
 # Kotlin related
 .kotlin/
 
+server/collector/*.mp4
